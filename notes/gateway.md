@@ -43,12 +43,12 @@ Layer 6: 协议定义 & 校验        protocol/ (TypeBox + AJV)
 ```
 1. 读取配置文件 → 校验 → 自动迁移旧格式
 2. 加载插件（plugin registry）
-3. 枚举 Channel 插件（WhatsApp/Telegram/Slack/...）
+3. 枚举 Channel 插件（WhatsApp/Telegram/Slack/...）← 见下方展开
 4. 解析运行时配置（绑定地址、认证模式、TLS）
 5. 创建运行时状态（WS Server, HTTP Server, 广播系统）
 6. 启动子系统：
    ├─ NodeRegistry（远程节点注册）
-   ├─ ChannelManager（消息通道管理）
+   ├─ ChannelManager（消息通道管理）← Channel 在此启动
    ├─ Discovery（mDNS/Bonjour 服务发现）
    ├─ CronService（定时任务）
    ├─ MaintenanceTimers（健康检查、去重清理）
@@ -57,6 +57,294 @@ Layer 6: 协议定义 & 校验        protocol/ (TypeBox + AJV)
    └─ ExecApprovalManager（执行审批）
 7. 挂载 WebSocket 处理器
 ```
+
+### 第 3 步展开：枚举 Channel 插件
+
+> 核心文件: `server-channels.ts` (ChannelManager) + `channels/plugins/index.ts` (枚举) + `channels/dock.ts` (轻量行为)
+> 类型定义: `channels/plugins/types.plugin.ts` + `types.core.ts` + `types.adapters.ts`
+
+#### 3.1 枚举过程 (`server.impl.ts:245-252`)
+
+插件加载（步骤 2）完成后，Channel 从 PluginRegistry 中提取出来：
+
+```
+listChannelPlugins()                         // channels/plugins/index.ts
+  → requireActivePluginRegistry()            // 拿到已加载的 PluginRegistry
+  → registry.channels.map(e => e.plugin)     // 取出所有 ChannelPlugin
+  → dedupeChannels()                         // 按 id 去重
+  → toSorted(CHAT_CHANNEL_ORDER)             // 按内置顺序排序，外部插件排后面
+```
+
+对每个 Channel 创建子系统日志器 + RuntimeEnv，并收集它们声明的额外 gateway RPC 方法
+（如 WhatsApp 声明 `"web.login.start"`, `"web.login.wait"`）合并到 gatewayMethods。
+
+#### 3.2 内置 Channel 列表 (8 个核心通道)
+
+定义在 `channels/registry.ts` 的 `CHAT_CHANNEL_ORDER`：
+
+| 序号 | Channel ID | 标签 | 接入方式 | 特点 |
+|------|-----------|------|---------|------|
+| 0 | `telegram` | Telegram (Bot API) | Bot Token + 长轮询/Webhook | 最简单的入门方式；支持 group/channel/thread |
+| 1 | `whatsapp` | WhatsApp (QR link) | QR 码扫描 + Web 协议 | 用你自己的号码；支持 polls/reactions |
+| 2 | `discord` | Discord (Bot API) | Bot Token + Gateway | 支持 threads、slash commands、block streaming |
+| 3 | `irc` | IRC (Server + Nick) | IRC 协议 | 经典 IRC；textChunkLimit=350（最短） |
+| 4 | `googlechat` | Google Chat (Chat API) | HTTP Webhook | Google Workspace；支持 threads |
+| 5 | `slack` | Slack (Socket Mode) | Socket Mode | 支持 threads、slash commands |
+| 6 | `signal` | Signal (signal-cli) | signal-cli 链接设备 | 最注重隐私；设置较复杂 |
+| 7 | `imessage` | iMessage (imsg) | BlueBubbles/本地 | 仍在开发中 |
+
+#### 3.3 扩展 Channel (extensions/ 目录)
+
+除 8 个内置通道外，`extensions/` 目录提供更多通道：
+
+| Extension | 说明 |
+|-----------|------|
+| `bluebubbles` | iMessage 的 BlueBubbles 后端 |
+| `feishu` | 飞书 |
+| `line` | LINE（日韩） |
+| `matrix` | Matrix 协议 (Element 等) |
+| `mattermost` | Mattermost |
+| `msteams` | Microsoft Teams |
+| `nextcloud-talk` | Nextcloud Talk |
+| `nostr` | Nostr 协议 |
+| `tlon` | Tlon/Urbit |
+| `zalo` / `zalouser` | Zalo（越南） |
+
+每个扩展导出一个 `ChannelPlugin` 对象，在插件加载阶段被 `register(api)` 注册到 PluginRegistry。
+
+#### 3.4 ChannelPlugin 契约 — 20 个 Adapter 插槽
+
+`ChannelPlugin<ResolvedAccount>` 是核心契约（`types.plugin.ts`），包含 20 个插槽：
+
+```
+ChannelPlugin {
+  id: ChannelId                        // 唯一标识
+  meta: ChannelMeta                    // UI 展示信息（label, blurb, docsPath, systemImage 等）
+  capabilities: ChannelCapabilities    // 能力声明（见下方）
+
+  // ─── 配置层 ───
+  config: ChannelConfigAdapter         // [必须] 账号列表、解析账号、启用/禁用
+  configSchema?: ChannelConfigSchema   // JSON Schema + UI hints（给 Web UI 渲染配置表单）
+  setup?: ChannelSetupAdapter          // CLI onboarding：验证输入 + 写入配置
+  onboarding?: ChannelOnboardingAdapter // CLI 向导步骤
+  reload?: { configPrefixes }          // 热重载：哪些配置前缀变化时需要重启通道
+
+  // ─── 安全层 ───
+  security?: ChannelSecurityAdapter    // DM 策略（pairing/allowFrom）+ 安全警告
+  pairing?: ChannelPairingAdapter      // 配对审批（idLabel + 通知审批消息）
+  auth?: ChannelAuthAdapter            // 通道专用登录流程
+  commands?: ChannelCommandAdapter     // 命令权限（是否只允许 owner 执行）
+  elevated?: ChannelElevatedAdapter    // allowFrom 降级回退
+
+  // ─── 消息层 ───
+  outbound?: ChannelOutboundAdapter    // [核心] 出站消息：sendText/sendMedia/sendPoll + 分块
+  mentions?: ChannelMentionAdapter     // @提及剥离（如 Discord 的 <@123>）
+  messaging?: ChannelMessagingAdapter  // 目标地址标准化（normalizeTarget）
+  threading?: ChannelThreadingAdapter  // 线程/回复策略（replyToMode: off/first/all）
+  streaming?: ChannelStreamingAdapter  // 流式输出合并参数（minChars/idleMs）
+  agentPrompt?: ChannelAgentPromptAdapter // 给 Agent 的提示词
+
+  // ─── 运行时层 ───
+  gateway?: ChannelGatewayAdapter      // [核心] startAccount / stopAccount / login / logout
+  status?: ChannelStatusAdapter        // 健康探测（probe）+ 审计 + 状态快照
+  heartbeat?: ChannelHeartbeatAdapter  // 心跳就绪检查 + 收件人解析
+  directory?: ChannelDirectoryAdapter  // 联系人/群组目录查询
+  resolver?: ChannelResolverAdapter    // 目标地址解析（name → id）
+  actions?: ChannelMessageActionAdapter // 消息动作（react、pin、delete 等）
+
+  // ─── 工具层 ───
+  agentTools?: ChannelAgentToolFactory | ChannelAgentTool[]  // Agent 可调用的通道工具
+  gatewayMethods?: string[]            // 额外的 Gateway RPC 方法名
+}
+```
+
+#### 3.5 capabilities — 通道能力声明
+
+```typescript
+ChannelCapabilities {
+  chatTypes: ("direct"|"group"|"channel"|"thread")[]  // 支持的会话类型
+  polls?: boolean           // 投票
+  reactions?: boolean       // 表情回应
+  edit?: boolean           // 编辑已发消息
+  unsend?: boolean         // 撤回消息
+  reply?: boolean          // 引用回复
+  effects?: boolean        // 消息特效
+  groupManagement?: boolean // 群管理
+  threads?: boolean        // 线程
+  media?: boolean          // 图片/视频/文件
+  nativeCommands?: boolean // 原生命令（如 Telegram /command、Discord slash）
+  blockStreaming?: boolean // 块模式流式输出（非实时编辑已发消息）
+}
+```
+
+各通道能力对比：
+
+| 通道 | chatTypes | polls | reactions | threads | media | nativeCmd | blockStream |
+|------|----------|-------|-----------|---------|-------|-----------|-------------|
+| Telegram | direct,group,channel,thread | - | ✓ | ✓ | ✓ | ✓ | ✓ |
+| WhatsApp | direct,group | ✓ | ✓ | - | ✓ | - | - |
+| Discord | direct,channel,thread | ✓ | ✓ | ✓ | ✓ | ✓ | - |
+| IRC | direct,group | - | - | - | ✓ | - | ✓ |
+| Google Chat | direct,group,thread | - | ✓ | ✓ | ✓ | - | ✓ |
+| Slack | direct,channel,thread | - | ✓ | ✓ | ✓ | ✓ | - |
+| Signal | direct,group | - | ✓ | - | ✓ | - | - |
+| iMessage | direct,group | - | ✓ | - | ✓ | - | - |
+
+#### 3.6 ChannelManager — 启停生命周期 (`server-channels.ts`)
+
+Gateway 创建 `ChannelManager` 管理所有通道的运行态：
+
+```
+createChannelManager({ loadConfig, channelLogs, channelRuntimeEnvs })
+  → 返回 { startChannels, startChannel, stopChannel, markChannelLoggedOut, getRuntimeSnapshot }
+```
+
+**内部状态** — 每个 Channel 一个 `ChannelRuntimeStore`：
+```
+ChannelRuntimeStore {
+  aborts: Map<accountId, AbortController>   // 每个账号的中止控制器
+  tasks: Map<accountId, Promise>            // 运行中的 startAccount 任务
+  runtimes: Map<accountId, ChannelAccountSnapshot>  // 运行时快照
+}
+```
+
+**startChannel 流程**（`server-channels.ts:96`）：
+```
+startChannel(channelId, accountId?)
+  │
+  ├─ getChannelPlugin(channelId)
+  │   → 从 PluginRegistry 查找 plugin
+  │   → 检查 plugin.gateway.startAccount 是否存在
+  │
+  ├─ listAccountIds(cfg)
+  │   → 一个通道可以有多个账号（如多个 Telegram bot）
+  │
+  └─ 对每个 accountId 并行启动：
+      │
+      ├─ 检查是否已在运行（tasks.has(id) → 跳过）
+      │
+      ├─ 检查是否启用 (plugin.config.isEnabled)
+      │   → 未启用: setRuntime({ running:false, lastError:"disabled" })
+      │
+      ├─ 检查是否已配置 (plugin.config.isConfigured)
+      │   → 未配置: setRuntime({ running:false, lastError:"not configured" })
+      │
+      └─ 启动:
+          ├─ 创建 AbortController
+          ├─ setRuntime({ running:true, lastStartAt })
+          └─ plugin.gateway.startAccount(ctx)  ← 核心！
+              │  ctx = { cfg, accountId, account, runtime, abortSignal, log, getStatus, setStatus }
+              │
+              ├─ Telegram: monitorTelegramProvider()  → 长轮询/webhook 监听
+              ├─ WhatsApp: startWhatsAppWeb()         → Puppeteer/WS 连接
+              ├─ Discord: startDiscordGateway()       → Discord Gateway WS
+              ├─ Slack: startSlackSocketMode()        → Slack Socket Mode
+              ├─ Signal: startSignalMonitor()         → signal-cli REST 轮询
+              └─ ...
+```
+
+**stopChannel 流程**（`server-channels.ts:181`）：
+```
+stopChannel(channelId, accountId?)
+  → 收集所有已知 accountId
+  → 对每个 account:
+     1. abort.abort()               // 发送 AbortSignal
+     2. plugin.gateway.stopAccount() // 调用插件的停止钩子
+     3. await task                   // 等待启动任务结束
+     4. 清理 store 状态
+```
+
+**startChannels**（`server-channels.ts:236`）— 启动时遍历所有已注册的 Channel：
+```
+for plugin of listChannelPlugins():
+  await startChannel(plugin.id)    // 顺序启动（不是并行）
+```
+
+#### 3.7 Dock — 轻量行为层 (`channels/dock.ts`)
+
+`ChannelDock` 是 `ChannelPlugin` 的子集投影，提供给**共享代码路径**（如回复流程、命令认证、Agent prompt）：
+
+```
+ChannelDock = {
+  id, capabilities, commands, outbound.textChunkLimit,
+  streaming, elevated, config.{resolveAllowFrom, formatAllowFrom},
+  groups, mentions, threading, agentPrompt
+}
+```
+
+设计目的：避免共享代码 `import` 整个 ChannelPlugin（会拉入 baileys/Discord Gateway/Telegram monitor 等重依赖）。
+- 8 个内置通道: 硬编码在 `DOCKS` 对象中
+- 扩展通道: 通过 `buildDockFromPlugin()` 从 ChannelPlugin 提取
+
+#### 3.8 以 Telegram 为例的完整 Adapter 实现
+
+```
+extensions/telegram/src/channel.ts → 导出 telegramPlugin: ChannelPlugin
+
+telegramPlugin = {
+  id: "telegram",
+  meta: { label:"Telegram", selectionLabel:"Telegram (Bot API)", ... },
+  capabilities: { chatTypes:["direct","group","channel","thread"], reactions, threads, media, nativeCommands, blockStreaming },
+  reload: { configPrefixes: ["channels.telegram"] },
+
+  config: {                                    // 配置适配
+    listAccountIds: listTelegramAccountIds,    // 从 cfg.channels.telegram.accounts 枚举
+    resolveAccount: resolveTelegramAccount,    // 读取 token/allowFrom/proxy 等
+    isConfigured: account => Boolean(account.token),
+    ...
+  },
+
+  security: {                                  // 安全适配
+    resolveDmPolicy: → { policy:"pairing", allowFrom:[...] }
+    collectWarnings: → groupPolicy="open" 时发出警告
+  },
+
+  outbound: {                                  // 出站消息
+    deliveryMode: "direct",                    // 直接调 Telegram API（不走 gateway 转发）
+    textChunkLimit: 4000,                      // 单条消息上限
+    chunkerMode: "markdown",                   // 按 Markdown 格式分块
+    sendText: → sendMessageTelegram(to, text, { messageThreadId, replyToMessageId })
+    sendMedia: → sendMessageTelegram(to, text, { mediaUrl, ... })
+  },
+
+  gateway: {                                   // 运行时生命周期
+    startAccount: async (ctx) => {
+      1. probeTelegram() → 探测 bot info (username)
+      2. monitorTelegramProvider({             // 核心：启动消息监听
+           token, accountId, config, runtime, abortSignal,
+           useWebhook, webhookUrl, webhookSecret, ...
+         })
+    },
+    logoutAccount: → 从配置删除 botToken → writeConfigFile
+  },
+
+  status: {                                    // 健康探测
+    probeAccount: → probeTelegram(token, timeoutMs, proxy)
+    auditAccount: → auditGroupMembership (检查 bot 是否在声明的群中)
+    buildAccountSnapshot: → { configured, tokenSource, running, mode:"polling"|"webhook", probe, ... }
+    collectStatusIssues: collectTelegramStatusIssues
+  },
+
+  directory: {                                 // 联系人目录
+    listPeers: → listTelegramDirectoryPeersFromConfig
+    listGroups: → listTelegramDirectoryGroupsFromConfig
+  },
+
+  setup: { ... },    // CLI 向导
+  pairing: { ... },  // 配对审批
+  actions: { ... },  // 消息动作
+  ...
+}
+```
+
+#### 3.9 设计要点
+
+1. **多账号架构** — 一个 Channel 可运行多个账号（如 3 个 Telegram bot），每个账号独立启停
+2. **能力声明驱动** — `capabilities` 让上层代码按能力分支（如有 `polls` 才提供投票工具），而非按通道名 if/else
+3. **Dock vs Plugin 分层** — 轻量 Dock 给共享路径，完整 Plugin 只在启动/运行时加载，避免拉入 puppeteer 等重依赖
+4. **AbortController 生命周期** — 每个 account 一个 AbortController，stopChannel 只需 abort() + 等待
+5. **顺序启动** — `startChannels` 逐个 Channel 串行启动（避免并发抢占资源），但每个 Channel 的多账号并行启动
+6. **配置热重载** — `reload.configPrefixes` 声明哪些配置路径变化时需要重启通道（如 `channels.telegram` 变化 → 重启 Telegram）
 
 ## WebSocket 连接生命周期
 
@@ -302,7 +590,8 @@ chat.abort { sessionKey, runId? }
 
 - [x] chat.ts 的聊天推理流程（Agent 调用、流式输出、abort）
 - [ ] dispatchReplyFromConfig 到 Agent Runtime 的完整调用链
-- [ ] Channel 插件如何将外部消息路由到 Agent？
+- [x] Channel 插件枚举 + ChannelPlugin 契约 + ChannelManager 启停生命周期
+- [ ] Channel inbound 消息流：monitor 收到消息后如何路由到 dispatchInboundMessage → Agent？
 - [ ] config-reload.ts 的热重载 vs 重启决策逻辑
 - [ ] Node（远程节点）的 pairing 和 command 执行流程
 - [ ] 广播系统的 backpressure（dropIfSlow）机制
