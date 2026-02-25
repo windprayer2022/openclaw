@@ -67,13 +67,16 @@ Skills（skills/）+ Tools（src/browser/ 等）
 > 随着阅读推进，在此更新
 
 - [x] Gateway 核心流程（含 chat.ts 聊天推理流程）
-- [ ] Agent 运行时与 LLM 调用
-- [ ] 消息通道插件机制
+- [x] Agent 运行时与 LLM 调用（完整调用链、双层重试、工具组装、流式管道、model fallback、auth profile）
+- [x] 消息通道插件机制（Channel 系统全貌：Dock/Plugin 两层、20 个 Adapter、入站/出站流、生命周期）
+- [x] Session 管理（Session Key 寻址、Store 持久化、SessionEntry 模型、生命周期 reset/freshness/fork、Transcript JSONL、维护机制）
+- [x] 类型系统与数据模型（双 Schema 体系、OpenClawConfig 26 字段、190+ 协议类型、15 Adapter、15 Hook、SessionEntry 40+ 字段）
+- [x] System Prompt 构建（6 阶段管线、3 种模式、~18 section、9 个 bootstrap 文件、截断策略、cache 友好设计）
+- [x] Compaction 机制（4 种触发、三层摘要 Fallback、safeguard 扩展、Memory Flush 预刷写、溢出恢复决策树）
+- [x] Skill 系统（6 来源加载合并、5 维资格判定、Snapshot 缓存、Prompt 注入、环境变量注入、5 种安装器、安全扫描、远程节点扩展、热刷新）
+- [x] Sandbox 系统（Docker 容器隔离、3 mode × 3 scope、FS Bridge、Tool Policy、Browser Bridge、Registry/Prune、Media Staging）
 - [ ] 配置系统
-- [ ] 会话管理
-- [ ] 类型系统与数据模型
 - [ ] 插件/扩展 SDK
-- [ ] 技能系统
 
 ## 构建与运行（供实验用）
 
